@@ -199,6 +199,14 @@ export default class Front extends Docker.Service<Front>()(
           yield* Effect.sleep("3 seconds");
           return yield* HttpServerResponse.json(yield* tally.alarmState());
         }
+        // `/stranded-alarm/<name>/strand` stores an alarm without scheduling
+        // it; `/state` reports what's left.
+        if (group === "stranded-alarm" && name !== undefined) {
+          const which = url.pathname.split("/").filter((segment) => segment.length > 0)[2];
+          const tally = parallelTallies.getByName(name);
+          if (which === "strand") yield* tally.strandAlarm();
+          return yield* HttpServerResponse.json(yield* tally.alarmState());
+        }
         // Calls that could deadlock on a transaction (see reentrant.ts).
         // Each returns how the instance saw it end, then what it holds.
         if (group === "reentrant" && name !== undefined) {

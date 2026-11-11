@@ -141,6 +141,8 @@ yield* state.storage.transaction(
 
 Its writes commit together if it succeeds and roll back if it fails, alarms included: an alarm set or cancelled inside takes effect when the transaction commits. No other call touches storage until it finishes, whatever it waits on.
 
+Rivet schedules an alarm set inside a transaction just after the transaction commits. If the room stops in between, the alarm is stored but not scheduled, so it can't fire. The room schedules it again the next time it starts, before it runs any call.
+
 A transaction runs for at most 30 seconds. Past that it's interrupted, rolled back, and dies with `Rivet.TransactionTimedOut`, so a transaction stuck waiting can't hold the room forever. Pass a timeout of your own as the second argument:
 
 ```typescript title="src/room.ts"

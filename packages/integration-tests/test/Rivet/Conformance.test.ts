@@ -144,6 +144,38 @@ describe.skipIf(!!process.env.FAST)(
       });
     }
 
+    test(
+      "an alarm stored but never scheduled fires once the next activation starts",
+      Effect.gen(function* () {
+        const client = yield* HttpClient.HttpClient;
+        const name = crypto.randomUUID();
+        const get = (which: string) =>
+          Effect.gen(function* () {
+            return (yield* Effect.suspend(() =>
+              client.get(`${baseUrl}/stranded-alarm/${name}/${which}`),
+            ).pipe(
+              Effect.flatMap((res) => res.json),
+              Effect.retry({ schedule: Schedule.spaced("2 seconds"), times: 10 }),
+            )) as { fired: number; alarm: number | null };
+          });
+        const stranded = yield* get("strand");
+        expect(stranded.fired).toBe(0);
+        expect(stranded.alarm).not.toBeNull();
+        // RivetKit sleeps an actor 30 seconds after its last call; the next
+        // call starts a new activation. Nothing may call it meanwhile.
+        yield* Effect.sleep("45 seconds");
+        const after = yield* get("state").pipe(
+          Effect.repeat({
+            schedule: Schedule.spaced("1 second"),
+            until: (state) => state.fired > 0,
+            times: 15,
+          }),
+        );
+        expect(after).toEqual({ fired: 1, alarm: null });
+      }),
+      { timeout: 150_000 },
+    );
+
     describe("calls that could deadlock on a transaction", () => {
       interface Outcome {
         ok: boolean;

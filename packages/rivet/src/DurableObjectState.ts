@@ -328,6 +328,32 @@ const setAlarm = (c: ActorContextLike, at: number, retries?: number) =>
     );
   });
 
+/**
+ * Schedule an alarm a transaction recorded that RivetKit never scheduled.
+ *
+ * `setAlarm` inside `storage.transaction` writes the alarm with the
+ * transaction and schedules it with RivetKit only once the transaction
+ * commits, since RivetKit's scheduler writes through the database the
+ * transaction holds until then. An activation that stops in between (the
+ * actor sleeps, the node shuts down or crashes) leaves an alarm that
+ * `getAlarm` reports and the engine never fires: it would wait for a call
+ * that may never come. A stored alarm without its RivetKit schedule is that
+ * alarm, so it's scheduled again, with a new token, when an activation
+ * starts and before its instance is built. Should the stopped activation's
+ * schedule land after all, it fires with the old token and does nothing.
+ *
+ * @internal
+ */
+export const repairAlarm = (c: ActorContextLike) =>
+  Effect.gen(function* () {
+    const alarm = yield* readAlarm(c);
+    if (alarm === undefined || alarm.id !== undefined) return;
+    yield* Effect.logWarning(
+      "Durable Object alarm was recorded but never scheduled; scheduling it now",
+    );
+    yield* setAlarm(c, alarm.at, alarm.retries);
+  });
+
 /** Build the state for one actor activation. @internal */
 export const makeDurableObjectState = (
   c: ActorContextLike,

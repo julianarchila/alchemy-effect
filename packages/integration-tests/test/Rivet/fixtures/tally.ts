@@ -2,8 +2,8 @@
  * Concurrent calls on one instance: plain get-then-put increments, which
  * only an input gate keeps from losing updates, transactional increments,
  * which never lose one, a background loop the constructor starts, a burst
- * of storage another call's storage can or can't overlap, and an alarm
- * replaced while it fires.
+ * of storage another call's storage can or can't overlap, an alarm
+ * replaced while it fires, and an alarm stored but never scheduled.
  *
  * `Tally` runs its calls fully in parallel; `GatedTally` (gated-tally.ts)
  * is the same class given `Workers.InputGate`.
@@ -89,6 +89,17 @@ export const TallyImpl = Effect.gen(function* () {
               yield* Effect.sleep("2 seconds");
               yield* state.storage.setAlarm(now + 600_000);
             }),
+          );
+        }),
+      // Leaves the alarm as an activation that stopped between a
+      // transaction's commit and RivetKit's schedule leaves it: stored, due
+      // in a second, and never scheduled.
+      strandAlarm: () =>
+        Effect.gen(function* () {
+          const now = yield* Effect.sync(() => Date.now());
+          yield* state.storage.sql.exec(
+            "INSERT INTO _alchemy_meta (key, value) VALUES ('alarm', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            JSON.stringify({ at: now + 1_000, token: "stranded" }),
           );
         }),
       alarmState: () =>

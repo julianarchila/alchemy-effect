@@ -27,6 +27,7 @@ import {
   DurableObjectState,
   makeDurableObjectState,
   migrateStorage,
+  repairAlarm,
   runFiredAlarm,
   type ActorContextLike,
 } from "../DurableObjectState.ts";
@@ -119,6 +120,8 @@ export const runDurableObjects = (durableObjects: ReadonlyArray<HostedDurableObj
     if (durableObjects.length === 0) return yield* Effect.never;
     const { actor, setup } = yield* Effect.promise(() => import("rivetkit"));
     const { db } = yield* Effect.promise(() => import("rivetkit/db"));
+    // Work an activation starts outside any call runs with the node's services.
+    const nodeContext = yield* Effect.context<never>();
 
     const use: Record<string, unknown> = {};
     for (const hosted of durableObjects) {
@@ -144,8 +147,17 @@ export const runDurableObjects = (durableObjects: ReadonlyArray<HostedDurableObj
         if (instance === undefined) {
           const activation = makeActivation();
           c.vars.activation = activation;
+          // An alarm a stopped activation committed but never scheduled is
+          // scheduled before the instance is built (see `repairAlarm`).
+          const repaired = Effect.runPromiseWith(nodeContext)(
+            repairAlarm(c).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logError("Durable Object alarm repair failed", cause),
+              ),
+            ),
+          );
           instance = makeDurableObjectInstance({
-            build: () => Promise.resolve(build),
+            build: () => repaired.then(() => build),
             // RivetKit runs an actor's calls concurrently over async
             // storage; a class given `Workers.InputGate` gets a gate per
             // instance from the bridge.
