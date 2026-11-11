@@ -28,10 +28,10 @@ export const TallyImpl = Effect.gen(function* () {
         return next;
       });
 
-    // 50 increments of "background" from a fiber the constructor forks,
-    // racing calls that increment it too.
+    // 50 increments of "background" from a fiber the constructor forks into
+    // the instance's scope, racing calls that increment it too.
     let backgroundDone = false;
-    yield* Effect.forkDetach(
+    yield* Effect.forkScoped(
       Effect.forEach(
         Array.from({ length: 50 }),
         () => Effect.andThen(increment("background"), Effect.sleep("5 millis")),

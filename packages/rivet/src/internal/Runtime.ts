@@ -188,6 +188,11 @@ export const runDurableObjects = (durableObjects: ReadonlyArray<HostedDurableObj
           const { instance, activation } = instanceOf(c);
           return handleRequest(instance, activation, request);
         },
+        // RivetKit ends the activation and keeps the node's process: end the
+        // instance with it, so the work its constructor started in its scope
+        // doesn't run on beside the next activation over the same storage.
+        onSleep: (c: ActivationContext) => c.vars.instance?.close(),
+        onDestroy: (c: ActivationContext) => c.vars.instance?.close(),
         actions: {
           // RivetKit times an action out after 60 seconds, and an alarm can
           // wait out a transaction before its handler runs as long as it

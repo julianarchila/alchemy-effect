@@ -20,6 +20,7 @@ import GatedTally from "./gated-tally.ts";
 import Greeter from "./greeter.ts";
 import { Reentrant } from "./reentrant-declaration.ts";
 import Room from "./room.ts";
+import Sleeper from "./sleeper.ts";
 import Tally from "./tally.ts";
 
 export default class Front extends Docker.Service<Front>()(
@@ -42,6 +43,7 @@ export default class Front extends Docker.Service<Front>()(
     const gatedTallies = yield* GatedTally;
     const reentrants = yield* Reentrant;
     const rooms = yield* Room;
+    const sleepers = yield* Sleeper;
     const chat = yield* ChatLog;
     const binary = yield* BinaryLog;
     const conformance = conformanceFetch(counters);
@@ -141,6 +143,17 @@ export default class Front extends Docker.Service<Front>()(
             name,
             url.pathname.split("/").filter((segment) => segment.length > 0)[2],
           ).pipe(Effect.orDie);
+        }
+        // `/sleeper/<name>/activation` starts an instance; `/status` reports
+        // which of its activations still run a fiber, and how many ended.
+        if (group === "sleeper" && name !== undefined) {
+          const which = url.pathname.split("/").filter((segment) => segment.length > 0)[2];
+          const sleeper = sleepers.getByName(name);
+          return yield* HttpServerResponse.json(
+            which === "status"
+              ? yield* sleeper.status()
+              : { activation: yield* sleeper.activation() },
+          );
         }
         if (group === "greet" && name !== undefined) {
           const greeting = yield* greeters.getByName("front").greet(name);
