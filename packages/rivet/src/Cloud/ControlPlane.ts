@@ -13,8 +13,10 @@ export interface ControlPlaneProps extends ClusterProps {}
  * connect out to it. Each stage gets a namespace of its own on the cluster.
  *
  * Deploys sign in to Rivet Cloud with the `RivetCloud` profile (a browser
- * sign-in, or a cluster token), or with `RIVET_CLOUD_TOKEN` and
- * `RIVET_CLOUD_CLUSTER` in CI. Self-hosted control planes need neither.
+ * sign-in, or tokens from the dashboard), or in CI with `RIVET_CLOUD_TOKEN`
+ * (an API token), `RIVET_CLOUD_ADMIN_TOKEN` (the cluster's admin token,
+ * which an API token can't read) and `RIVET_CLOUD_CLUSTER`. Self-hosted
+ * control planes need none of these.
  *
  * ### Connecting to Rivet Cloud
  * **Example:** The cluster chosen at sign-in

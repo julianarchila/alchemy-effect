@@ -31,8 +31,10 @@ export interface Cluster extends Resource<
 > {}
 
 /**
- * A Rivet Cloud cluster, read with the signed-in account: its engine
- * endpoint and admin token. Rivet Cloud creates and deletes clusters in its
+ * A Rivet Cloud cluster, read with the Rivet Cloud credentials: its engine
+ * endpoint and admin token. A browser sign-in reads the admin token from
+ * Rivet Cloud; an API token can't, so CI gives it as
+ * `RIVET_CLOUD_ADMIN_TOKEN`. Rivet Cloud creates and deletes clusters in its
  * dashboard; this resource only reads one, and destroying it leaves the
  * cluster as it is. `RivetCloud.ControlPlane` uses it.
  *
@@ -46,7 +48,7 @@ export interface Cluster extends Resource<
  */
 export const Cluster = Resource<Cluster>("RivetCloud.Cluster");
 
-/** The cluster gave this credential no admin token. */
+/** Neither the Cloud API nor the credentials give the cluster's admin token. */
 export class ClusterAdminTokenUnavailable extends Data.TaggedError(
   "RivetCloud.ClusterAdminTokenUnavailable",
 )<{
@@ -62,15 +64,29 @@ export const ClusterProvider = () =>
         const resolved = yield* credentials;
         const name = cluster ?? resolved.cluster;
         const info = yield* getCluster(resolved, name);
-        if (info.admin_token === null) {
+        // A sign-in session reads the admin token from the Cloud API. An API
+        // token can't, so CI gives it with the credentials; it is the admin
+        // token of the credentials' own cluster only.
+        const adminToken =
+          info.admin_token != null
+            ? Redacted.make(info.admin_token)
+            : name === resolved.cluster
+              ? resolved.adminToken
+              : undefined;
+        if (adminToken === undefined) {
           return yield* new ClusterAdminTokenUnavailable({
-            message: `Rivet Cloud cluster '${name}' gave this credential no admin token.`,
+            message:
+              resolved.adminToken === undefined
+                ? `Rivet Cloud gave this credential no admin token for cluster '${name}': an API token can't read it. ` +
+                  `Set RIVET_CLOUD_ADMIN_TOKEN (or the profile's admin token) to the admin token in the cluster's Overview → Connection information.`
+                : `Rivet Cloud gave this credential no admin token for cluster '${name}', and the admin token in the credentials is cluster '${resolved.cluster}''s. ` +
+                  `Deploy to '${resolved.cluster}', or sign in with the browser.`,
           });
         }
         return {
           name: info.cluster,
           endpoint: `https://${info.domain}`,
-          adminToken: Redacted.make(info.admin_token),
+          adminToken,
         };
       });
       return {

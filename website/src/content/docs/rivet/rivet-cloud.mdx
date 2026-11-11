@@ -32,14 +32,20 @@ Self-hosted control planes never ask for this: only `RivetCloud.ControlPlane` si
 
 ## Sign in from CI
 
-CI can't approve a code. Create a cluster token in the Rivet dashboard with the `rivet:cluster:read`, `rivet:cluster:engine:read` and `rivet:cluster:engine:write` scopes and no expiry, and give it to the job with the cluster's name:
+CI can't approve a code, so it uses two tokens from the cluster's page in the [Rivet dashboard](https://dashboard.rivet.dev), one for each API a deploy calls:
+
+- An **API token**, for the Rivet Cloud API. Create it under **Settings → API tokens** with the **Read** permission, plus **Deploy** if you use `RivetCloud.Pool`, which uploads builds and rolls out runner pools.
+- The cluster's **admin token**, for the cluster's engine, which creates the stage's namespace and pools and hands nodes their token. Copy it from **Overview → Connection information**. An API token can't read it, whatever its permissions.
+
+Give both to the job with the cluster's name:
 
 ```sh title=".env"
-RIVET_CLOUD_TOKEN=...
+RIVET_CLOUD_TOKEN=...        # Settings → API tokens
+RIVET_CLOUD_ADMIN_TOKEN=...  # Overview → Connection information
 RIVET_CLOUD_CLUSTER=my-cluster
 ```
 
-The same token can go in a profile instead, as the "Cluster token" method.
+The same values can go in a profile instead, as the "Dashboard tokens" method. Keep the admin token secret: it has full access to the cluster.
 
 ## Choose a cluster
 

@@ -9,6 +9,7 @@ import {
 import { displayRedacted } from "alchemy/Auth/Credentials";
 import {
   getEnv,
+  getEnvRedacted,
   getEnvRedactedRequired,
   getEnvRequired,
   mapPromptCancellation,
@@ -43,8 +44,9 @@ export const RIVET_CLOUD_AUTH_PROVIDER_NAME = "RivetCloud";
 
 /**
  * A Rivet Cloud profile: a browser sign-in (`login`), which refreshes
- * itself, or a cluster token created in the Rivet dashboard (`stored`), for
- * CI. Both name the cluster deploys use. A sign-in also names the
+ * itself, or tokens copied from the Rivet dashboard (`stored`), for CI: an
+ * API token for the Cloud API and the cluster's admin token for its
+ * engine. Both name the cluster deploys use. A sign-in also names the
  * organization it acts in when the account belongs to several.
  */
 export const RivetCloudAuthConfigSchema = Schema.Union([
@@ -61,6 +63,8 @@ export const RivetCloudAuthConfigSchema = Schema.Union([
     method: Schema.Literal("stored"),
     cluster: Schema.String,
     token: Schema.String,
+    /** The cluster's admin token, which the API token can't read. */
+    adminToken: Schema.optional(Schema.String),
   }),
 ]);
 export type RivetCloudAuthConfig = typeof RivetCloudAuthConfigSchema.Type;
@@ -68,8 +72,13 @@ type LoginConfig = Extract<RivetCloudAuthConfig, { method: "login" }>;
 
 /** Rivet Cloud credentials, as a deploy uses them. */
 export interface RivetCloudCredentials {
-  /** A bearer token for the Cloud API: a sign-in session or a cluster token. */
+  /** A bearer token for the Cloud API: a sign-in session or an API token. */
   readonly token: Redacted.Redacted<string>;
+  /**
+   * The cluster's admin token, for the cluster's engine. A sign-in session
+   * reads it from the Cloud API; an API token can't, so it is given here.
+   */
+  readonly adminToken?: Redacted.Redacted<string> | undefined;
   /** The cluster's name. */
   readonly cluster: string;
   /** The organization a sign-in session acts in, for an account in several. */
@@ -181,21 +190,33 @@ const pasteToken = Effect.fn(function* () {
     validate: (value) => (value.length === 0 ? "Required" : undefined),
   }).pipe(mapPromptCancellation);
   const token = yield* Interaction.password({
-    message: "Rivet Cloud cluster token",
+    message: "Rivet Cloud API token (cluster Settings → API tokens)",
+    validate: (value) => (value.length === 0 ? "Required" : undefined),
+  }).pipe(mapPromptCancellation);
+  const adminToken = yield* Interaction.password({
+    message: "Rivet Cloud admin token (cluster Overview → Connection information)",
     validate: (value) => (value.length === 0 ? "Required" : undefined),
   }).pipe(mapPromptCancellation);
   yield* Interaction.success("RivetCloud: credentials saved.");
-  return { method: "stored" as const, cluster, token } satisfies RivetCloudAuthConfig;
+  return { method: "stored" as const, cluster, token, adminToken } satisfies RivetCloudAuthConfig;
 });
 
 const clusterTokenFields: ReadonlyArray<ConfigureField> = [
   { name: "cluster", label: "Rivet Cloud cluster name" },
   {
     name: "token",
-    label: "Rivet Cloud cluster token",
+    label: "Rivet Cloud API token",
     secret: true,
     description:
-      "Create one in the Rivet dashboard with the rivet:cluster:read, rivet:cluster:engine:read and rivet:cluster:engine:write scopes.",
+      "Create one under the cluster's Settings → API tokens with Read, and Deploy for RivetCloud.Pool.",
+  },
+  {
+    name: "adminToken",
+    label: "Rivet Cloud admin token",
+    secret: true,
+    optional: true,
+    description:
+      "Copy it from the cluster's Overview → Connection information. An API token can't read it.",
   },
 ];
 
@@ -204,10 +225,11 @@ const clusterTokenFields: ReadonlyArray<ConfigureField> = [
  * resolves these credentials; self-hosted control planes never ask for them.
  *
  * - `login`: sign in with the browser; the session refreshes itself.
- * - `stored`: a cluster token from the Rivet dashboard, which never expires.
+ * - `stored`: an API token and the cluster's admin token, copied from the
+ *   Rivet dashboard.
  *
- * In CI, `RIVET_CLOUD_TOKEN` and `RIVET_CLOUD_CLUSTER` take the place of a
- * profile. A sign-in to an account in several organizations asks which one
+ * In CI, `RIVET_CLOUD_TOKEN`, `RIVET_CLOUD_ADMIN_TOKEN` and
+ * `RIVET_CLOUD_CLUSTER` take the place of a profile. A sign-in to an account in several organizations asks which one
  * to act in, or takes it from `RIVET_CLOUD_ORGANIZATION`.
  */
 export const RivetCloudAuth = AuthProviderLayer<RivetCloudAuthConfig, RivetCloudCredentials>()(
@@ -227,8 +249,8 @@ export const RivetCloudAuth = AuthProviderLayer<RivetCloudAuthConfig, RivetCloud
           },
           {
             value: "stored" as const,
-            label: "Cluster token",
-            description: "a token from the Rivet dashboard, for CI",
+            label: "Dashboard tokens",
+            description: "an API token and the admin token from the Rivet dashboard, for CI",
           },
         ],
       });
@@ -269,6 +291,9 @@ export const RivetCloudAuth = AuthProviderLayer<RivetCloudAuthConfig, RivetCloud
               method: "stored",
               cluster: storedValueText(values.cluster) ?? "",
               token: storedValueText(values.token) ?? "",
+              ...(storedValueText(values.adminToken) === undefined
+                ? {}
+                : { adminToken: storedValueText(values.adminToken) }),
             })),
           )
         : Effect.fail(
@@ -315,6 +340,9 @@ export const RivetCloudAuth = AuthProviderLayer<RivetCloudAuthConfig, RivetCloud
       config.method === "stored"
         ? Effect.succeed<RivetCloudCredentials>({
             token: Redacted.make(config.token),
+            ...(config.adminToken === undefined
+              ? {}
+              : { adminToken: Redacted.make(config.adminToken) }),
             cluster: config.cluster,
             source: "stored",
           })
@@ -378,6 +406,9 @@ export const RivetCloudAuth = AuthProviderLayer<RivetCloudAuthConfig, RivetCloud
               ? []
               : [{ key: "organization", value: credentials.organization }]),
             { key: "token", value: displayRedacted(credentials.token) },
+            ...(credentials.adminToken === undefined
+              ? []
+              : [{ key: "adminToken", value: displayRedacted(credentials.adminToken) }]),
             ...(credentials.expires === undefined
               ? []
               : [{ key: "expires", value: new Date(credentials.expires).toISOString() }]),
@@ -388,10 +419,17 @@ export const RivetCloudAuth = AuthProviderLayer<RivetCloudAuthConfig, RivetCloud
 
     const readEnvironment = Effect.gen(function* () {
       const token = yield* getEnvRedactedRequired("RIVET_CLOUD_TOKEN");
+      // An empty variable, as CI leaves an unset secret, means none.
+      const adminToken = yield* getEnvRedacted("RIVET_CLOUD_ADMIN_TOKEN").pipe(
+        Effect.map((value) =>
+          value === undefined || Redacted.value(value).trim() === "" ? undefined : value,
+        ),
+      );
       const cluster = yield* getEnvRequired("RIVET_CLOUD_CLUSTER");
       const organization = (yield* getEnv("RIVET_CLOUD_ORGANIZATION"))?.trim() || undefined;
       return {
         token,
+        ...(adminToken === undefined ? {} : { adminToken }),
         cluster,
         ...(organization === undefined ? {} : { organization }),
         source: "env" as const,
@@ -413,7 +451,15 @@ export const RivetCloudAuth = AuthProviderLayer<RivetCloudAuthConfig, RivetCloud
           name: "RIVET_CLOUD_TOKEN",
           required: true,
           secret: true,
-          description: "A cluster token from the Rivet dashboard.",
+          description:
+            "An API token from the cluster's Settings → API tokens: Read, and Deploy for RivetCloud.Pool.",
+        },
+        {
+          name: "RIVET_CLOUD_ADMIN_TOKEN",
+          required: false,
+          secret: true,
+          description:
+            "The cluster's admin token, from its Overview → Connection information. An API token can't read it.",
         },
         {
           name: "RIVET_CLOUD_CLUSTER",
@@ -424,7 +470,7 @@ export const RivetCloudAuth = AuthProviderLayer<RivetCloudAuthConfig, RivetCloud
           name: "RIVET_CLOUD_ORGANIZATION",
           required: false,
           description:
-            "The organization to act in, for an account in several. A cluster token needs none.",
+            "The organization to act in, for an account in several. An API token needs none.",
         },
       ],
     };

@@ -23,8 +23,8 @@ let baseUrl = "";
 // Rivet Cloud runs (a RivetCloud.Pool), called from a Lambda. Each deploy
 // that changes the node program builds an image with the local docker CLI
 // and uploads it, and Rivet takes minutes to prepare it. Deploys sign in with the RivetCloud profile
-// (`alchemy profile edit --add RivetCloud`) or RIVET_CLOUD_TOKEN and
-// RIVET_CLOUD_CLUSTER.
+// (`alchemy profile edit --add RivetCloud`) or RIVET_CLOUD_TOKEN,
+// RIVET_CLOUD_ADMIN_TOKEN and RIVET_CLOUD_CLUSTER.
 describe.skipIf(!!process.env.FAST)(
   "Rivet Cloud (RivetCloud.Pool)",
   { tags: ["provider:rivet", "provider:rivet:cloud", "provider:aws", "live"] },

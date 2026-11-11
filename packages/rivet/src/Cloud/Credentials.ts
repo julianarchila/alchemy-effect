@@ -5,7 +5,8 @@ import type { RivetCloudCredentials } from "./AuthProvider.ts";
 
 /**
  * Rivet Cloud credentials, resolved on first use from the `RivetCloud`
- * profile or from `RIVET_CLOUD_TOKEN` and `RIVET_CLOUD_CLUSTER`.
+ * profile or from `RIVET_CLOUD_TOKEN`, `RIVET_CLOUD_ADMIN_TOKEN` and
+ * `RIVET_CLOUD_CLUSTER`.
  * `Rivet.providers()` provides it; nothing resolves it unless a
  * `RivetCloud.ControlPlane` is deployed.
  */

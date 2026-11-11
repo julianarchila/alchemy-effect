@@ -35,7 +35,11 @@ export const ClusterInfo = Schema.Struct({
   cluster: Schema.String,
   slug: Schema.String,
   domain: Schema.String,
-  admin_token: Schema.NullOr(Schema.String),
+  /**
+   * The engine's admin token. Rivet Cloud returns it to a sign-in session
+   * only: an API token gets no `admin_token` key at all.
+   */
+  admin_token: Schema.optional(Schema.NullOr(Schema.String)),
   status: Schema.Struct({ state: Schema.String }),
 });
 export type ClusterInfo = typeof ClusterInfo.Type;

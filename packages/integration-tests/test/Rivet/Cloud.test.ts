@@ -22,8 +22,8 @@ let baseUrl = "";
 // The engine conformance spec, run against Rivet Durable Objects on a Rivet
 // Cloud cluster, with pools of ECS Fargate nodes connecting out to it, called
 // from a Lambda. Deploys sign in with the RivetCloud profile
-// (`alchemy profile edit --add RivetCloud`) or RIVET_CLOUD_TOKEN and
-// RIVET_CLOUD_CLUSTER.
+// (`alchemy profile edit --add RivetCloud`) or RIVET_CLOUD_TOKEN,
+// RIVET_CLOUD_ADMIN_TOKEN and RIVET_CLOUD_CLUSTER.
 describe.skipIf(!!process.env.FAST)(
   "Rivet Cloud (ECS Fargate pool)",
   { tags: ["provider:rivet", "provider:rivet:cloud", "provider:aws", "live"] },
