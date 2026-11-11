@@ -103,11 +103,21 @@ export interface DurableObjectInstanceOptions {
 export interface DurableObjectInstance {
   /**
    * The instance, built once per in-memory activation: the export's
-   * two-phase constructor runs with the state service and the captured
-   * services provided. Rejects if the build fails (not memoized — see
-   * `getWorkerExport`).
+   * two-phase constructor runs with the state service, the captured
+   * services and the instance's `Scope` provided. Rejects if the build
+   * fails (not memoized — see `getWorkerExport`).
    */
   readonly instance: Promise<BuiltDurableObject>;
+  /**
+   * End the instance: close the `Scope` its constructor ran with, once the
+   * build settles, so the fibers it forked into that scope are interrupted
+   * and its finalizers run. Only the first call closes it.
+   *
+   * For engines that end an activation and keep the process (Rivet puts an
+   * idle actor to sleep). workerd never calls it: it evicts the isolate,
+   * which ends the instance's work with it.
+   */
+  readonly close: () => Promise<void>;
   /**
    * Run one call against the instance under a fresh `Scope` (provided as
    * `Scope.Scope`), the instance's state service, and the event
@@ -150,6 +160,10 @@ export const makeDurableObjectInstance = ({
   runtimeContext,
   initialize,
 }: DurableObjectInstanceOptions): DurableObjectInstance => {
+  // The instance's lifetime, provided to its constructor as `Scope.Scope`:
+  // what the constructor forks into it or acquires on it lasts until the
+  // engine ends the instance (`close`), not until construction finishes.
+  const instanceScope = Scope.makeUnsafe();
   const instance: Promise<BuiltDurableObject> = (gate ?? ((run) => run()))(() =>
     build(waitUntil).then(({ context, runtimeContext: runtime, export: exported, telemetry }) => {
       const { constructor } = exported;
@@ -171,6 +185,7 @@ export const makeDurableObjectInstance = ({
             Effect.suspend(() => {
               const seal = initialize?.();
               const instanceContext = Layer.succeed(RuntimeContext, instanceRuntimeContext).pipe(
+                Layer.provideMerge(Layer.succeed(Scope.Scope, instanceScope)),
                 Layer.provideMerge(doContext),
               );
               return inner.pipe(
@@ -318,5 +333,14 @@ export const makeDurableObjectInstance = ({
     return own as HttpEffect<any>;
   };
 
-  return { instance, execute, dispatch, fetch };
+  let closed: Promise<void> | undefined;
+  const close = () =>
+    (closed ??= instance
+      .then(
+        () => {},
+        () => {},
+      )
+      .then(() => Effect.runPromise(Scope.close(instanceScope, Exit.void))));
+
+  return { instance, close, execute, dispatch, fetch };
 };
