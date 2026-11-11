@@ -290,6 +290,36 @@ describe.skipIf(!!process.env.FAST)(
       );
     });
 
+    describe("when an instance sleeps", () => {
+      test(
+        "its stop effects run, and a fiber its constructor forked doesn't outlive it",
+        Effect.gen(function* () {
+          const client = yield* HttpClient.HttpClient;
+          const name = crypto.randomUUID();
+          const get = <T>(which: string) =>
+            Effect.gen(function* () {
+              return (yield* Effect.suspend(() =>
+                client.get(`${baseUrl}/sleeper/${name}/${which}`),
+              ).pipe(
+                Effect.flatMap((res) => res.json),
+                Effect.retry({ schedule: Schedule.spaced("2 seconds"), times: 10 }),
+              )) as T;
+            });
+          const { activation } = yield* get<{ activation: string }>("activation");
+          // RivetKit sleeps an actor 30 seconds after its last call. Nothing
+          // may call it meanwhile, or it stays awake.
+          yield* Effect.sleep("45 seconds");
+          const status = yield* get<{ activation: string; running: string[]; stops: number }>(
+            "status",
+          );
+          expect(status.activation).not.toBe(activation);
+          expect(status.running).toEqual([status.activation]);
+          expect(status.stops).toBe(1);
+        }),
+        { timeout: 150_000 },
+      );
+    });
+
     test(
       "a second class on the same pool calls the first through the gateway",
       Effect.gen(function* () {

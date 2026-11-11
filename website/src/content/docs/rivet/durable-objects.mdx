@@ -155,6 +155,17 @@ return {
 
 `alarm` isn't a method; callers can't run it. The room sets the alarm itself with `state.storage.setAlarm`. See [Storage](/rivet/storage#set-an-alarm).
 
+## End its work when it sleeps
+
+Rivet puts a room to sleep 30 seconds after its last call, but the node's process keeps running. A fiber the inner Effect forked keeps running too, beside the room the next call wakes over the same storage. Register what ends it with `state.onStop`:
+
+```typescript title="src/room.ts"
+const fiber = yield* Effect.forkDetach(refreshPresence);
+yield* state.onStop(Fiber.interrupt(fiber));
+```
+
+The effect runs once when the room sleeps or is destroyed. The next call starts the room again from its storage. Cloudflare has no `onStop`: it evicts the object's isolate, which ends its work with it.
+
 ## Keep its code out of its callers
 
 A caller imports the class to call it, and the class carries its implementation with it. When the implementation is large, or imports things a caller shouldn't bundle, declare the class on its own with the shape of its methods:

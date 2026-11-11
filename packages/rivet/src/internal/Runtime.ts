@@ -25,9 +25,12 @@ import type { HostedDurableObject } from "../DurableObject.ts";
 import {
   ALARM_ACTION,
   DurableObjectState,
+  makeActivationLifecycle,
   makeDurableObjectState,
   migrateStorage,
   runFiredAlarm,
+  runStops,
+  type ActivationLifecycle,
   type ActorContextLike,
 } from "../DurableObjectState.ts";
 import {
@@ -45,6 +48,8 @@ import {
 interface ActivationVars {
   instance: DurableObjectInstance | undefined;
   activation: Activation | undefined;
+  /** The effects to run when the activation stops; exists before the instance. */
+  lifecycle: ActivationLifecycle;
 }
 
 type ActivationContext = ActorContextLike & { readonly vars: ActivationVars };
@@ -149,7 +154,10 @@ export const runDurableObjects = (durableObjects: ReadonlyArray<HostedDurableObj
             // RivetKit runs an actor's calls concurrently over async
             // storage; a class given `Workers.InputGate` gets a gate per
             // instance from the bridge.
-            services: Context.make(DurableObjectState, makeDurableObjectState(c, activation)).pipe(
+            services: Context.make(
+              DurableObjectState,
+              makeDurableObjectState(c, activation, c.vars.lifecycle),
+            ).pipe(
               // Construction runs under the activation's construction
               // section; each call replaces it with what it was sent.
               Context.add(Awaiting, {
@@ -183,11 +191,20 @@ export const runDurableObjects = (durableObjects: ReadonlyArray<HostedDurableObj
 
       use[name] = actor({
         db: db({ onMigrate: (database) => migrateStorage(database) }),
-        createVars: (): ActivationVars => ({ instance: undefined, activation: undefined }),
+        createVars: (): ActivationVars => ({
+          instance: undefined,
+          activation: undefined,
+          lifecycle: makeActivationLifecycle(),
+        }),
         onRequest: (c: ActivationContext, request: Request) => {
           const { instance, activation } = instanceOf(c);
           return handleRequest(instance, activation, request);
         },
+        // RivetKit keeps the node's process when the actor stops: the
+        // instance's in-memory work ends with the activation, through the
+        // effects it registered with `state.onStop`.
+        onSleep: (c: ActivationContext) => runStops(c.vars.lifecycle),
+        onDestroy: (c: ActivationContext) => runStops(c.vars.lifecycle),
         actions: {
           // RivetKit times an action out after 60 seconds, and an alarm can
           // wait out a transaction before its handler runs as long as it

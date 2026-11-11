@@ -131,6 +131,28 @@ export interface DurableObjectStateShape {
   readonly storage: DurableObjectStorage;
   /** Keep the instance awake until `effect` completes. */
   waitUntil<A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<void, never, R>;
+  /**
+   * Run `effect` when this activation ends: Rivet puts the idle instance to
+   * sleep (30 seconds after its last call), or destroys it.
+   *
+   * RivetKit stops the actor and keeps the node's process, so work the
+   * instance started in memory, such as a fiber its constructor forked,
+   * keeps running after it sleeps, beside the instance the next call
+   * starts over the same storage. End that work here; the next activation
+   * starts again from storage. Every registered effect runs once, all of
+   * them concurrently, with the context of the code that registered it; a
+   * failure is logged.
+   *
+   * Cloudflare has no counterpart: it evicts the isolate, which ends the
+   * instance's work with it.
+   *
+   * @example
+   * ```typescript
+   * const fiber = yield* Effect.forkDetach(heartbeat);
+   * yield* state.onStop(Fiber.interrupt(fiber));
+   * ```
+   */
+  onStop<R>(effect: Effect.Effect<void, never, R>): Effect.Effect<void, never, R>;
 }
 
 /** The running Durable Object instance's state. */
@@ -332,6 +354,7 @@ const setAlarm = (c: ActorContextLike, at: number, retries?: number) =>
 export const makeDurableObjectState = (
   c: ActorContextLike,
   activation: Activation,
+  lifecycle: ActivationLifecycle,
 ): DurableObjectStateShape => {
   const name = c.key[0] ?? "";
 
@@ -502,7 +525,42 @@ export const makeDurableObjectState = (
           c.waitUntil(promise);
         });
       }),
+    onStop: <R>(effect: Effect.Effect<void, never, R>) =>
+      Effect.gen(function* () {
+        const context = yield* Effect.context<R>();
+        lifecycle.stops.push(() =>
+          Effect.runPromiseWith(context)(
+            effect.pipe(
+              Effect.catchCause((cause) =>
+                Effect.logError("Durable Object stop handler failed", cause),
+              ),
+            ),
+          ),
+        );
+      }),
   };
+};
+
+/**
+ * What one actor activation holds besides its instance: the effects to run
+ * when it stops. Created with the activation's vars, before its instance.
+ *
+ * @internal
+ */
+export interface ActivationLifecycle {
+  readonly stops: Array<() => Promise<void>>;
+}
+
+/** @internal */
+export const makeActivationLifecycle = (): ActivationLifecycle => ({ stops: [] });
+
+/**
+ * Run the activation's stop effects, each once: RivetKit's `onSleep` and
+ * `onDestroy` both end it. @internal
+ */
+export const runStops = async (lifecycle: ActivationLifecycle) => {
+  const stops = lifecycle.stops.splice(0);
+  await Promise.all(stops.map((stop) => stop()));
 };
 
 /**
