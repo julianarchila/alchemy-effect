@@ -27,6 +27,7 @@ import { buildEventTelemetry } from "../TelemetryRuntime.ts";
 import type { DurableObjectExport, DurableObjectShape } from "./DurableObject.ts";
 import { EventLifetime, makeEventLifetime } from "./EventLifetime.ts";
 import { gateCall, InstanceInputGate, makeInputGate } from "./InputGate.ts";
+import { InstanceLifetime, makeInstanceLifetime } from "./InstanceLifetime.ts";
 import { handleRpcExit, type Pin, type WorkerBuild } from "./Worker.ts";
 import { withEventContext } from "./WorkerBridge.ts";
 
@@ -103,11 +104,29 @@ export interface DurableObjectInstanceOptions {
 export interface DurableObjectInstance {
   /**
    * The instance, built once per in-memory activation: the export's
-   * two-phase constructor runs with the state service and the captured
-   * services provided. Rejects if the build fails (not memoized — see
-   * `getWorkerExport`).
+   * two-phase constructor runs with the state service, the captured
+   * services and the instance's own `Scope` provided. Rejects if the build
+   * fails (not memoized — see `getWorkerExport`).
    */
   readonly instance: Promise<BuiltDurableObject>;
+  /**
+   * End the instance, for engines that end an activation and keep the
+   * process (Rivet puts an idle actor to sleep; the node's process runs on).
+   * Its work stops before the next instance over the same storage starts:
+   *
+   * 1. New calls, and work handed to `waitUntil`, are interrupted before
+   *    they start.
+   * 2. Every fiber the instance runs is interrupted: its construction if
+   *    still running, its calls, and the work they handed to `waitUntil`.
+   *    Uninterruptible regions finish first.
+   * 3. The calls' scopes close, then the instance's own scope: fibers its
+   *    constructor forked into it are interrupted and its finalizers run.
+   *
+   * Only the first call does this; every call resolves once it is done.
+   * workerd never calls it: it evicts the isolate, which ends the
+   * instance's work with it.
+   */
+  readonly close: () => Promise<void>;
   /**
    * Run one call against the instance under a fresh `Scope` (provided as
    * `Scope.Scope`), the instance's state service, and the event
@@ -150,6 +169,12 @@ export const makeDurableObjectInstance = ({
   runtimeContext,
   initialize,
 }: DurableObjectInstanceOptions): DurableObjectInstance => {
+  // The instance's scope and fibers: what its constructor forks into or
+  // acquires on its scope lasts until the engine ends it (`close`).
+  const lifetime = makeInstanceLifetime();
+  const lifetimeContext = Context.make(InstanceLifetime, lifetime.service).pipe(
+    Context.add(Scope.Scope, lifetime.scope),
+  );
   const instance: Promise<BuiltDurableObject> = (gate ?? ((run) => run()))(() =>
     build(waitUntil).then(({ context, runtimeContext: runtime, export: exported, telemetry }) => {
       const { constructor } = exported;
@@ -158,7 +183,8 @@ export const makeDurableObjectInstance = ({
         ? Context.add(exported.services, InstanceInputGate, Effect.runSync(makeInputGate))
         : exported.services;
       const instanceRuntimeContext = runtimeContext ? runtimeContext(runtime, context) : runtime;
-      const doContext = Layer.succeedContext(engineServices).pipe(
+      const doContext = Layer.succeedContext(lifetimeContext).pipe(
+        Layer.provideMerge(Layer.succeedContext(engineServices)),
         Layer.provideMerge(Layer.succeedContext(services)),
         Layer.provideMerge(Layer.succeedContext(context)),
       );
@@ -180,17 +206,23 @@ export const makeDurableObjectInstance = ({
             }),
           ),
         ),
-      ).pipe(
-        Effect.provide(doContext),
-        Effect.map((built): BuiltDurableObject => ({
-          instance: built as DurableObjectInstanceShape,
-          services: Context.add(services, RuntimeContext, instanceRuntimeContext),
-          context,
-          runtime: instanceRuntimeContext,
-          telemetry,
-        })),
-        Effect.runPromise,
-      );
+      )
+        .pipe(
+          Effect.provide(doContext),
+          Effect.map((built): BuiltDurableObject => ({
+            instance: built as DurableObjectInstanceShape,
+            services: Context.add(services, RuntimeContext, instanceRuntimeContext),
+            context,
+            runtime: instanceRuntimeContext,
+            telemetry,
+          })),
+          // One of the instance's fibers: ending the instance mid-construction
+          // interrupts it.
+          lifetime.service.run,
+        )
+        .then((exit) =>
+          Exit.isSuccess(exit) ? exit.value : Promise.reject(Cause.squash(exit.cause)),
+        );
     }),
   );
 
@@ -202,8 +234,18 @@ export const makeDurableObjectInstance = ({
     // Work this call hands to `waitUntil` runs after it returns, in its
     // context: the call's scope waits for it before closing.
     const event = makeEventLifetime(scope);
+    // Ending the instance closes its scope only after this call's has closed.
+    let released!: () => void;
+    lifetime.hold(new Promise<void>((resolve) => (released = resolve)));
 
-    const { instance: shape, services, context, runtime, telemetry } = await instance;
+    let built: BuiltDurableObject;
+    try {
+      built = await instance;
+    } catch (error) {
+      released();
+      throw error;
+    }
+    const { instance: shape, services, context, runtime, telemetry } = built;
 
     // A class given the `InputGate` Layer has a gate; the call runs
     // through it so storage can't interleave between calls.
@@ -212,6 +254,7 @@ export const makeDurableObjectInstance = ({
         Effect.provide(
           Layer.mergeAll(
             Layer.succeedContext(engineServices),
+            Layer.succeed(InstanceLifetime, lifetime.service),
             Layer.succeed(EventLifetime, event.lifetime),
             Layer.succeed(Scope.Scope, scope),
             // The instance's decorated runtime context (its durable callback
@@ -219,15 +262,17 @@ export const makeDurableObjectInstance = ({
             Layer.succeed(RuntimeContext, runtime),
             // The configured telemetry exporters, attached to the *call*
             // scope by `buildEventTelemetry` so buffered telemetry flushes
-            // when the scope closes into `waitUntil` below (the instance
-            // scope never finalizes on workerd).
+            // when the scope closes into `waitUntil` below (the instance's
+            // own scope closes only when an engine ends it, never on
+            // workerd).
             Layer.effectContext(buildEventTelemetry(context, scope, telemetry())),
           ).pipe(
             Layer.provideMerge(Layer.succeedContext(services)),
             Layer.provideMerge(Layer.succeedContext(context)),
           ),
         ),
-        Effect.runPromiseExit,
+        // One of the instance's fibers: ending the instance interrupts it.
+        lifetime.service.run,
       )
       .then((exit) => {
         event.holdScope();
@@ -242,9 +287,9 @@ export const makeDurableObjectInstance = ({
           // Match `processEvent`: yield one macrotask so the
           // HttpMiddleware tracer's late span-end reaches the telemetry
           // exporter before the scope's flush finalizer.
-          new Promise((resolve) => setTimeout(resolve, 0)).then(() =>
-            Effect.runPromise(Scope.close(scope, Exit.void)),
-          ),
+          new Promise((resolve) => setTimeout(resolve, 0))
+            .then(() => Effect.runPromise(Scope.close(scope, Exit.void)))
+            .finally(released),
         ),
       );
   };
@@ -318,5 +363,5 @@ export const makeDurableObjectInstance = ({
     return own as HttpEffect<any>;
   };
 
-  return { instance, execute, dispatch, fetch };
+  return { instance, close: lifetime.close, execute, dispatch, fetch };
 };

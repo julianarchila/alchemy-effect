@@ -21,6 +21,7 @@ import GatedTally from "./gated-tally.ts";
 import Greeter from "./greeter.ts";
 import { Reentrant } from "./reentrant-declaration.ts";
 import Room from "./room.ts";
+import Sleeper from "./sleeper.ts";
 import SocketRoom from "./socket-room.ts";
 import Tally from "./tally.ts";
 
@@ -44,6 +45,7 @@ export default class Front extends Docker.Service<Front>()(
     const gatedTallies = yield* GatedTally;
     const reentrants = yield* Reentrant;
     const rooms = yield* Room;
+    const sleepers = yield* Sleeper;
     const socketRooms = yield* SocketRoom;
     const chat = yield* ChatLog;
     const binary = yield* BinaryLog;
@@ -157,6 +159,15 @@ export default class Front extends Docker.Service<Front>()(
           return yield* HttpServerResponse.json({
             sockets: yield* socketRooms.getByName(name).sockets().pipe(Effect.orDie),
           });
+        }
+        // `/sleeper/<name>/<activation|hold|status>`: what an instance's
+        // ended activations left running on the node.
+        if (group === "sleeper" && name !== undefined) {
+          const which = url.pathname.split("/").filter((segment) => segment.length > 0)[2];
+          const sleeper = sleepers.getByName(name);
+          if (which === "status") return yield* HttpServerResponse.json(yield* sleeper.status());
+          const activation = yield* which === "hold" ? sleeper.hold() : sleeper.activation();
+          return yield* HttpServerResponse.json({ activation });
         }
         if (group === "greet" && name !== undefined) {
           const greeting = yield* greeters.getByName("front").greet(name);

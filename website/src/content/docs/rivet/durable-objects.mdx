@@ -179,6 +179,19 @@ return {
 
 `alarm` isn't a method; callers can't run it. The room sets the alarm itself with `state.storage.setAlarm`. See [Storage](/rivet/storage#set-an-alarm).
 
+## End its work when it sleeps
+
+Rivet puts a room to sleep 30 seconds after its last call, but the node's process keeps running. The inner Effect runs with the room's own `Scope`, which closes when the room sleeps or is destroyed. Fork background work into it, and add finalizers to it:
+
+```typescript title="src/room.ts"
+yield* Effect.forkScoped(refreshPresence);
+yield* Effect.addFinalizer(() => state.storage.put("asleepAt", Date.now()).pipe(Effect.ignore));
+```
+
+When the room sleeps, its work ends before the next call starts it again from its storage. Calls still running and work handed to `state.waitUntil` are interrupted, their scopes close, and then the room's scope closes: the fiber is interrupted and the finalizer runs. Storage still works meanwhile. All of it has to fit in Rivet's shutdown window, 15 seconds by default; an `Effect.uninterruptible` region finishes before the interruption lands.
+
+`state.waitUntil` doesn't keep a room awake, and a fiber forked with `Effect.forkDetach` isn't part of the room: it keeps running beside the next one. On Cloudflare the scope never closes; workerd evicts the object's isolate instead, which ends its work with it.
+
 ## Keep its code out of its callers
 
 A caller imports the class to call it, and the class carries its implementation with it. When the implementation is large, or imports things a caller shouldn't bundle, declare the class on its own with the shape of its methods:

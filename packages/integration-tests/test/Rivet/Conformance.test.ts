@@ -291,6 +291,45 @@ describe.skipIf(!!process.env.FAST)(
       );
     });
 
+    describe("when an instance sleeps", () => {
+      test(
+        "it ends: its constructor's fiber and its calls' background work stop, and its finalizers run",
+        Effect.gen(function* () {
+          const client = yield* HttpClient.HttpClient;
+          const name = crypto.randomUUID();
+          const get = <T>(which: string) =>
+            Effect.gen(function* () {
+              return (yield* Effect.suspend(() =>
+                client.get(`${baseUrl}/sleeper/${name}/${which}`),
+              ).pipe(
+                Effect.flatMap((res) => res.json),
+                Effect.retry({ schedule: Schedule.spaced("2 seconds"), times: 10 }),
+              )) as T;
+            });
+          const { activation } = yield* get<{ activation: string }>("hold");
+          const before = yield* get<{ activation: string; loops: string[]; held: string[] }>(
+            "status",
+          );
+          expect(before).toMatchObject({ activation, loops: [activation], held: [activation] });
+          // RivetKit sleeps an actor 30 seconds after its last call, whatever
+          // `waitUntil` work it still runs. Nothing may call it meanwhile.
+          yield* Effect.sleep("45 seconds");
+          const after = yield* get<{
+            activation: string;
+            loops: string[];
+            held: string[];
+            ends: number;
+          }>("status");
+          expect(after.activation).not.toBe(activation);
+          // Only the new activation's fiber runs; the old one's work ended.
+          expect(after.loops).toEqual([after.activation]);
+          expect(after.held).toEqual([]);
+          expect(after.ends).toBe(1);
+        }),
+        { timeout: 150_000 },
+      );
+    });
+
     test(
       "a second class on the same pool calls the first through the gateway",
       Effect.gen(function* () {

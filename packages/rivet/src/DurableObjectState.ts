@@ -1,4 +1,4 @@
-import { EventLifetime } from "alchemy/Workers/EventLifetime";
+import { startInBackground } from "alchemy/Workers/EventLifetime";
 import { gateExclusive, gateStorage } from "alchemy/Workers/InputGate";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -7,7 +7,6 @@ import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
-import * as Option from "effect/Option";
 import { notAwaited, openSection, within, type Activation } from "./internal/Calls.ts";
 import type { SocketRegistry } from "./internal/Sockets.ts";
 import type { WebSocket } from "./WebSocket.ts";
@@ -131,7 +130,12 @@ export interface DurableObjectStateShape {
   /** The name the instance was addressed by (`getByName(name)`). */
   readonly id: { readonly name: string; toString(): string };
   readonly storage: DurableObjectStorage;
-  /** Keep the instance awake until `effect` completes. */
+  /**
+   * Run `effect` in the background, with the caller's context and a scope of
+   * its own; the calling call's scope stays open until it completes. It
+   * doesn't keep the instance awake: RivetKit can put the actor to sleep
+   * while it runs, and the instance's end (sleep or destroy) interrupts it.
+   */
   waitUntil<A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<void, never, R>;
   /**
    * The open WebSockets this instance accepted with `Rivet.upgrade()`; with
@@ -501,16 +505,8 @@ export const makeDurableObjectState = (
     getWebSockets: (tag) => Effect.sync(() => sockets.all(tag)),
     // As on Cloudflare: the work runs with the caller's context and a scope
     // of its own, and the call's scope stays open until it settles.
-    waitUntil: (effect) =>
-      Effect.gen(function* () {
-        const context = yield* Effect.context<never>();
-        const lifetime = yield* Effect.serviceOption(EventLifetime);
-        yield* Effect.sync(() => {
-          const promise = Effect.runPromiseWith(context)(effect.pipe(Effect.scoped) as never);
-          if (Option.isSome(lifetime)) lifetime.value.extend(promise);
-          c.waitUntil(promise);
-        });
-      }),
+    // The instance's end interrupts it.
+    waitUntil: (effect) => startInBackground(effect, (promise) => c.waitUntil(promise)),
   };
 };
 

@@ -852,9 +852,11 @@ export class DurableObjectScope extends Context.Service<DurableObjectScope, Dura
  * what the method acquired on it, and its spans and logs are exported with
  * the call's. What the work acquires itself is released when it finishes.
  *
- * Attach cleanup to method scopes, not the constructor (init) closure —
- * the constructor runs once per in-memory instance under
- * `blockConcurrencyWhile`, and its scope is not tied to any call.
+ * Attach cleanup to method scopes, not the constructor (init) closure.
+ * The constructor runs once per in-memory instance under
+ * `blockConcurrencyWhile`, with a `Scope` of its own that lasts as long as
+ * the instance. On Cloudflare that scope never closes: workerd evicts the
+ * isolate without notice, so finalizers added to it never run.
  *
  * **Example:** Responding before finishing the work
  * ```typescript
