@@ -48,7 +48,7 @@ import {
   type SocketRegistry,
 } from "./Sockets.ts";
 
-/** What an actor activation keeps in memory until it sleeps. */
+/** What an actor activation keeps in memory until it sleeps or is destroyed. */
 interface ActivationVars {
   instance: DurableObjectInstance | undefined;
   activation: Activation | undefined;
@@ -306,6 +306,13 @@ export const runDurableObjects = (durableObjects: ReadonlyArray<HostedDurableObj
           const { instance, activation, sockets } = instanceOf(c);
           return handleWebSocket(instance, activation, sockets, c.request, ws);
         },
+        // RivetKit ends the activation and keeps the node's process: the
+        // instance ends with it, so nothing it started runs on beside the
+        // next activation over the same storage. Its calls and background
+        // work are interrupted and its scope closes, inside RivetKit's
+        // shutdown window, while storage still works.
+        onSleep: (c: ActivationContext) => c.vars.instance?.close(),
+        onDestroy: (c: ActivationContext) => c.vars.instance?.close(),
         actions: {
           // RivetKit times an action out after 60 seconds, and an alarm can
           // wait out a transaction before its handler runs as long as it

@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
 import type { RuntimeContext } from "../RuntimeContext.ts";
+import { backgroundPromise, InstanceLifetime } from "./InstanceLifetime.ts";
 
 /**
  * The current event's lifetime. The Worker and Durable Object bridges close
@@ -37,12 +38,30 @@ export class EventLifetime extends Context.Service<
 export const runInBackground = <A, E, R>(
   effect: Effect.Effect<A, E, R>,
   register: (promise: Promise<unknown>) => void,
-): Effect.Effect<void, never, R | RuntimeContext> =>
+): Effect.Effect<void, never, R | RuntimeContext> => startInBackground(effect, register);
+
+/**
+ * {@link runInBackground} without the `RuntimeContext` color, for an engine
+ * whose state service declares its own `waitUntil`.
+ *
+ * Inside a Durable Object instance the work runs as one of the instance's
+ * fibers ({@link InstanceLifetime}), so the instance's end interrupts it.
+ *
+ * @internal
+ */
+export const startInBackground = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  register: (promise: Promise<unknown>) => void,
+): Effect.Effect<void, never, R> =>
   Effect.gen(function* () {
     const context = yield* Effect.context<R>();
     const lifetime = yield* Effect.serviceOption(EventLifetime);
+    const instance = yield* Effect.serviceOption(InstanceLifetime);
     yield* Effect.sync(() => {
-      const promise = Effect.runPromiseWith(context)(effect.pipe(Effect.scoped));
+      const work = effect.pipe(Effect.scoped);
+      const promise = Option.isSome(instance)
+        ? backgroundPromise(instance.value.run(Effect.provideContext(work, context)))
+        : Effect.runPromiseWith(context)(work);
       if (Option.isSome(lifetime)) lifetime.value.extend(promise);
       register(promise);
     });

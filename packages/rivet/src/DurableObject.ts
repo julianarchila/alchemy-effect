@@ -337,6 +337,14 @@ const createRuntimeContext = (id: string): DurableObjectRuntimeContext => {
  * `crate`, it is a Rust program that its pool compiles into the node image.
  * Either needs a pool of its own, and has no bindings or `yield*` calls.
  *
+ * The inner Effect runs with the instance's own `Scope`. RivetKit puts an
+ * idle actor to sleep but keeps the node's process, so the instance ends
+ * with the activation: when the actor sleeps or is destroyed, its calls and
+ * the work they handed to `state.waitUntil` are interrupted, then its scope
+ * closes, interrupting fibers the constructor forked into it
+ * (`Effect.forkScoped`) and running its finalizers. The next activation
+ * starts from storage with nothing of the last one running.
+ *
  * An instance's calls run in parallel, storage included: unlike Cloudflare,
  * there is no input gate. Make a read-then-write atomic with
  * `state.storage.transaction(...)`, or provide `Workers.InputGate` (from
@@ -369,6 +377,21 @@ const createRuntimeContext = (id: string): DurableObjectRuntimeContext => {
  *     });
  *   }).pipe(Effect.provide(Default)),
  * ) {}
+ * ```
+ *
+ * ### Ending work when the instance sleeps
+ * **Example:** A background loop and a finalizer that end with the instance
+ * ```typescript
+ * Effect.gen(function* () {
+ *   const state = yield* Rivet.DurableObjectState;
+ *   // Interrupted when the actor sleeps or is destroyed.
+ *   yield* Effect.forkScoped(refreshPresence);
+ *   // Runs then, while storage still works.
+ *   yield* Effect.addFinalizer(() =>
+ *     state.storage.put("asleepAt", Date.now()).pipe(Effect.ignore),
+ *   );
+ *   return {};
+ * });
  * ```
  *
  * ### Calling a Durable Object
