@@ -7,6 +7,7 @@ import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import type * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import { notAwaited, openSection, within, type Activation } from "./internal/Calls.ts";
 import type { SocketRegistry } from "./internal/Sockets.ts";
@@ -29,6 +30,8 @@ export interface ActorContextLike {
   waitUntil(promise: Promise<unknown>): void;
   /** Keep the actor awake until `promise` settles. */
   keepAwake<T>(promise: Promise<T>): Promise<T>;
+  /** Stop the actor once its running work settles; the next call starts it again. */
+  sleep(): void;
 }
 
 /** An actor's raw SQLite database, or a transaction on it. @internal */
@@ -138,7 +141,60 @@ export interface DurableObjectStateShape {
    * `tag`, only those accepted with it.
    */
   getWebSockets(tag?: string): Effect.Effect<ReadonlyArray<WebSocket>>;
+  /**
+   * Reset the instance, as Cloudflare's `state.abort` does: the instance is
+   * discarded and the next call builds a fresh one, which starts from
+   * storage. Never returns: the calling fiber is interrupted.
+   *
+   * Construction, every call still running, work handed to `waitUntil` and
+   * streamed response bodies are interrupted, so their finalizers run, and
+   * the instance's WebSockets close with code 1011. A call that arrives
+   * before the actor has stopped is refused: HTTP 503, which an RPC caller
+   * sees as `RpcCallError` with `status: 503`. Then the actor sleeps.
+   *
+   * An `alarm` handler interrupted by `abort` is retried, as a failed one
+   * is, unless `options.retryAlarm` is `false`.
+   *
+   * RivetKit keeps the node's process, so a fiber the instance forked
+   * detached outlives the reset: end it from `onStop`.
+   */
+  abort(reason?: string, options?: DurableObjectAbortOptions): Effect.Effect<never>;
 }
+
+/** Options for {@link DurableObjectStateShape.abort}. */
+export interface DurableObjectAbortOptions {
+  /**
+   * Retry an `alarm` handler the abort interrupts, as a failed one is.
+   * Set it to `false` to drop that alarm instead.
+   * @default true
+   */
+  readonly retryAlarm?: boolean;
+}
+
+/**
+ * How one actor activation is aborted. Created with the activation, before
+ * its instance; the runtime wires `abort` once the instance exists.
+ *
+ * @internal
+ */
+export interface ActivationAbort {
+  /** Set once the activation is aborted. */
+  aborted: { readonly reason: string; readonly retryAlarm: boolean } | undefined;
+  /** Work handed to `waitUntil` still running. */
+  readonly background: Set<Fiber.Fiber<unknown, unknown>>;
+  /** Aborted with the activation: ends its streamed response bodies. */
+  readonly controller: AbortController;
+  /** Abort the activation: interrupt its work, refuse new calls, then sleep. */
+  abort: (reason: string, options?: DurableObjectAbortOptions) => void;
+}
+
+/** @internal */
+export const makeActivationAbort = (): ActivationAbort => ({
+  aborted: undefined,
+  background: new Set(),
+  controller: new AbortController(),
+  abort: () => {},
+});
 
 /** The running Durable Object instance's state. */
 export class DurableObjectState extends Context.Service<
@@ -340,6 +396,7 @@ export const makeDurableObjectState = (
   c: ActorContextLike,
   activation: Activation,
   sockets: SocketRegistry,
+  aborting: ActivationAbort,
 ): DurableObjectStateShape => {
   const name = c.key[0] ?? "";
 
@@ -506,11 +563,25 @@ export const makeDurableObjectState = (
         const context = yield* Effect.context<never>();
         const lifetime = yield* Effect.serviceOption(EventLifetime);
         yield* Effect.sync(() => {
-          const promise = Effect.runPromiseWith(context)(effect.pipe(Effect.scoped) as never);
+          // An aborted instance starts no more work.
+          if (aborting.aborted !== undefined) return;
+          const fiber = Effect.runForkWith(context)(effect.pipe(Effect.scoped) as never);
+          aborting.background.add(fiber);
+          const promise = new Promise<void>((resolve) =>
+            fiber.addObserver(() => {
+              aborting.background.delete(fiber);
+              resolve();
+            }),
+          );
           if (Option.isSome(lifetime)) lifetime.value.extend(promise);
           c.waitUntil(promise);
         });
       }),
+    abort: (reason = "aborted", options) =>
+      Effect.logError(`Durable Object '${name}' aborted: ${reason}`).pipe(
+        Effect.andThen(Effect.sync(() => aborting.abort(reason, options))),
+        Effect.andThen(Effect.interrupt),
+      ),
   };
 };
 
@@ -553,9 +624,14 @@ export const runFiredAlarm = (
   c: ActorContextLike,
   token: unknown,
   handler: Effect.Effect<void, unknown> | undefined,
-) =>
-  Effect.gen(function* () {
-    const fired = yield* claimFiredAlarm(c, token);
+  options: {
+    /** Whether a handler that was interrupted (by `abort`) is retried. */
+    readonly retryInterrupted: () => boolean;
+  } = { retryInterrupted: () => true },
+) => {
+  let fired: StoredAlarm | undefined;
+  return Effect.gen(function* () {
+    fired = yield* claimFiredAlarm(c, token);
     if (fired === undefined || handler === undefined) return;
     const exit = yield* Effect.exit(handler);
     if (Exit.isSuccess(exit)) return;
@@ -566,6 +642,30 @@ export const runFiredAlarm = (
         : `Durable Object alarm failed ${ALARM_RETRIES + 1} times; giving up`,
       exit.cause,
     );
+    yield* retryAlarm(c, fired);
+  }).pipe(
+    Effect.onInterrupt(() => {
+      // Interrupted (the instance was aborted) before it was claimed: the
+      // next activation claims it. A token that was claimed meanwhile no
+      // longer matches, and does nothing.
+      if (fired === undefined) return redeliverAlarm(c, token);
+      // After: the alarm is cleared, so it runs again only if it's set
+      // again here.
+      if (handler === undefined || !options.retryInterrupted()) return Effect.void;
+      return Effect.logWarning("Durable Object alarm interrupted; retrying").pipe(
+        Effect.andThen(retryAlarm(c, fired)),
+      );
+    }),
+  );
+};
+
+/**
+ * Set a fired alarm again, its retries counted, unless it was retried as
+ * many times as an alarm is or its handler set a new one.
+ */
+const retryAlarm = (c: ActorContextLike, fired: StoredAlarm) =>
+  Effect.gen(function* () {
+    const retries = fired.retries ?? 0;
     if (retries >= ALARM_RETRIES) return;
     yield* gateStorage(
       Effect.gen(function* () {
@@ -575,3 +675,12 @@ export const runFiredAlarm = (
       }),
     );
   });
+
+/**
+ * Deliver a fired alarm again `delay` ms from now, with the same token: an
+ * aborted activation can't run it, and the next one will. @internal
+ */
+export const redeliverAlarm = (c: ActorContextLike, token: unknown, delay = 1_000) =>
+  Effect.flatMap(Clock.currentTimeMillis, (now) =>
+    Effect.promise(() => c.schedule.at(now + delay, ALARM_ACTION, token)),
+  ).pipe(Effect.asVoid);

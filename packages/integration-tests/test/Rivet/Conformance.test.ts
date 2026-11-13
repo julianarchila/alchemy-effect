@@ -145,6 +145,58 @@ describe.skipIf(!!process.env.FAST)(
       });
     }
 
+    describe("state.abort", () => {
+      const run = <T>(path: string) =>
+        Effect.gen(function* () {
+          const client = yield* HttpClient.HttpClient;
+          const res = yield* client.get(`${baseUrl}/resettable/${crypto.randomUUID()}/${path}`);
+          expect(res.status).toBe(200);
+          return (yield* res.json) as T;
+        });
+
+      test(
+        "resets the instance: running calls are interrupted and the next call builds a fresh one",
+        Effect.gen(function* () {
+          const result = yield* run<{
+            before: { boots: number; calls: number };
+            aborted: number;
+            hang: number;
+            hangMs: number;
+            after: { boots: number; calls: number };
+            hangInterrupted: number;
+          }>("reset");
+          expect(result.before).toEqual({ boots: 1, calls: 2 });
+          // The aborting call never returns, and the hanging one ends with it.
+          expect(result.aborted).toBe(503);
+          expect(result.hang).toBe(503);
+          expect(result.hangMs).toBeLessThan(10_000);
+          // A fresh instance: built again from storage, its memory gone.
+          expect(result.after).toEqual({ boots: 2, calls: 1 });
+          // The hanging call's finalizer ran, in the aborted instance.
+          expect(result.hangInterrupted).toBe(1);
+        }),
+        { timeout: 120_000 },
+      );
+
+      for (const retry of [true, false]) {
+        test(
+          retry
+            ? "an alarm that aborts its instance is retried in the next one"
+            : "an alarm that aborts with retryAlarm: false is dropped",
+          Effect.gen(function* () {
+            const result = yield* run<{
+              ran: { runs: number; alarm: number | null };
+              final: { runs: number; alarm: number | null };
+              boots: number;
+            }>(`alarm?retry=${retry ? 1 : 0}`);
+            expect(result.final).toEqual({ runs: retry ? 2 : 1, alarm: null });
+            expect(result.boots).toBe(2);
+          }),
+          { timeout: 120_000 },
+        );
+      }
+    });
+
     describe("calls that could deadlock on a transaction", () => {
       interface Outcome {
         ok: boolean;

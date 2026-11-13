@@ -13,8 +13,10 @@
  */
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import type * as Fiber from "effect/Fiber";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
 import * as Layer from "effect/Layer";
 import * as Scope from "effect/Scope";
@@ -41,6 +43,25 @@ export const RESERVED_DURABLE_OBJECT_HANDLERS: ReadonlySet<string> = new Set([
   "webSocketClose",
   "webSocketError",
 ]);
+
+/**
+ * The defect a call on an aborted instance ends with: one that was running
+ * when the instance was aborted, or one that arrived after.
+ */
+export class DurableObjectAborted extends Data.TaggedError("DurableObjectAborted")<{
+  readonly reason: string;
+}> {
+  override get message() {
+    return `Durable Object aborted: ${this.reason}`;
+  }
+}
+
+/** Whether `exit` is a call ended by {@link DurableObjectInstance.abort}. */
+export const isAbortedExit = (exit: Exit.Exit<unknown, unknown>): boolean =>
+  Exit.isFailure(exit) &&
+  exit.cause.reasons.some(
+    (reason) => Cause.isDieReason(reason) && reason.defect instanceof DurableObjectAborted,
+  );
 
 /** The built instance shape: the lifecycle handlers plus the RPC surface. */
 export type DurableObjectInstanceShape = DurableObjectShape & Record<string, unknown>;
@@ -138,6 +159,18 @@ export interface DurableObjectInstance {
     instance: DurableObjectInstanceShape,
     request: { readonly url: string },
   ) => HttpEffect<any>;
+  /**
+   * Reset the instance, for engines that keep the process when they stop an
+   * object (workerd resets the isolate instead). Construction and every call
+   * still running are interrupted, so their finalizers run; a call started
+   * afterwards does not run. Both end with the defect
+   * {@link DurableObjectAborted}. Interrupting is all this does: the engine
+   * discards the instance and starts the next one from storage. Later calls
+   * are no-ops.
+   */
+  readonly abort: (reason: string) => void;
+  /** Why the instance was aborted, once it has been. */
+  readonly aborted: () => DurableObjectAborted | undefined;
 }
 
 export const makeDurableObjectInstance = ({
@@ -150,6 +183,19 @@ export const makeDurableObjectInstance = ({
   runtimeContext,
   initialize,
 }: DurableObjectInstanceOptions): DurableObjectInstance => {
+  let aborted: DurableObjectAborted | undefined;
+  // Construction and the calls running now: what `abort` interrupts.
+  const running = new Set<Fiber.Fiber<unknown, unknown>>();
+  const interruptible = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    Effect.withFiber((fiber) => {
+      if (aborted !== undefined) return Effect.die(aborted);
+      running.add(fiber);
+      return Effect.ensuring(
+        effect,
+        Effect.sync(() => running.delete(fiber)),
+      );
+    });
+
   const instance: Promise<BuiltDurableObject> = (gate ?? ((run) => run()))(() =>
     build(waitUntil).then(({ context, runtimeContext: runtime, export: exported, telemetry }) => {
       const { constructor } = exported;
@@ -165,22 +211,21 @@ export const makeDurableObjectInstance = ({
       // Construction runs through the gate as a call of its own, so fibers it
       // forks (a background loop) belong to that call and their storage is
       // gated like any call's.
-      return gateCall(
-        constructor.pipe(
-          Effect.flatMap((inner) =>
-            Effect.suspend(() => {
-              const seal = initialize?.();
-              const instanceContext = Layer.succeed(RuntimeContext, instanceRuntimeContext).pipe(
-                Layer.provideMerge(doContext),
-              );
-              return inner.pipe(
-                Effect.provide(instanceContext),
-                Effect.ensuring(Effect.sync(() => seal?.())),
-              );
-            }),
-          ),
+      return constructor.pipe(
+        Effect.flatMap((inner) =>
+          Effect.suspend(() => {
+            const seal = initialize?.();
+            const instanceContext = Layer.succeed(RuntimeContext, instanceRuntimeContext).pipe(
+              Layer.provideMerge(doContext),
+            );
+            return inner.pipe(
+              Effect.provide(instanceContext),
+              Effect.ensuring(Effect.sync(() => seal?.())),
+            );
+          }),
         ),
-      ).pipe(
+        gateCall,
+        interruptible,
         Effect.provide(doContext),
         Effect.map((built): BuiltDurableObject => ({
           instance: built as DurableObjectInstanceShape,
@@ -203,11 +248,22 @@ export const makeDurableObjectInstance = ({
     // context: the call's scope waits for it before closing.
     const event = makeEventLifetime(scope);
 
-    const { instance: shape, services, context, runtime, telemetry } = await instance;
+    // An instance aborted while it was being built never finishes it.
+    const built = await instance.catch((error: unknown) => {
+      if (aborted === undefined) throw error;
+      return undefined;
+    });
+    if (built === undefined || aborted !== undefined) {
+      return settle(Exit.die(aborted), scope, event, onExit);
+    }
+    const { instance: shape, services, context, runtime, telemetry } = built;
 
     // A class given the `InputGate` Layer has a gate; the call runs
     // through it so storage can't interleave between calls.
-    return Effect.andThen(event.holdExporters, gateCall(Effect.suspend(() => fn(shape))))
+    return Effect.andThen(
+      event.holdExporters,
+      Effect.suspend(() => fn(shape)).pipe(gateCall, interruptible),
+    )
       .pipe(
         Effect.provide(
           Layer.mergeAll(
@@ -229,24 +285,48 @@ export const makeDurableObjectInstance = ({
         ),
         Effect.runPromiseExit,
       )
-      .then((exit) => {
-        event.holdScope();
-        return onExit
-          ? onExit(exit, event.lifetime)
-          : exit._tag === "Success"
-            ? Promise.resolve(exit.value as T)
-            : Promise.reject(Cause.squash(exit.cause));
-      })
-      .finally(() =>
-        waitUntil(
-          // Match `processEvent`: yield one macrotask so the
-          // HttpMiddleware tracer's late span-end reaches the telemetry
-          // exporter before the scope's flush finalizer.
-          new Promise((resolve) => setTimeout(resolve, 0)).then(() =>
-            Effect.runPromise(Scope.close(scope, Exit.void)),
-          ),
+      .then((exit) =>
+        settle(
+          // A call `abort` interrupted ends with why.
+          aborted !== undefined && Exit.hasInterrupts(exit) ? Exit.die(aborted) : exit,
+          scope,
+          event,
+          onExit,
         ),
       );
+  };
+
+  const settle = <T>(
+    exit: Exit.Exit<any, any>,
+    scope: Scope.Closeable,
+    event: ReturnType<typeof makeEventLifetime>,
+    onExit:
+      | ((exit: Exit.Exit<any, any>, lifetime: EventLifetime["Service"]) => Promise<T>)
+      | undefined,
+  ): Promise<T> => {
+    event.holdScope();
+    return (
+      onExit
+        ? onExit(exit, event.lifetime)
+        : exit._tag === "Success"
+          ? Promise.resolve(exit.value as T)
+          : Promise.reject(Cause.squash(exit.cause))
+    ).finally(() =>
+      waitUntil(
+        // Match `processEvent`: yield one macrotask so the
+        // HttpMiddleware tracer's late span-end reaches the telemetry
+        // exporter before the scope's flush finalizer.
+        new Promise((resolve) => setTimeout(resolve, 0)).then(() =>
+          Effect.runPromise(Scope.close(scope, Exit.void)),
+        ),
+      ),
+    );
+  };
+
+  const abort = (reason: string) => {
+    if (aborted !== undefined) return;
+    aborted = new DurableObjectAborted({ reason });
+    for (const fiber of running) fiber.interruptUnsafe();
   };
 
   const dispatch =
@@ -318,5 +398,5 @@ export const makeDurableObjectInstance = ({
     return own as HttpEffect<any>;
   };
 
-  return { instance, execute, dispatch, fetch };
+  return { instance, execute, dispatch, fetch, abort, aborted: () => aborted };
 };

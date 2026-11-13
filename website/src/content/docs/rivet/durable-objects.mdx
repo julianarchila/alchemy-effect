@@ -179,6 +179,18 @@ return {
 
 `alarm` isn't a method; callers can't run it. The room sets the alarm itself with `state.storage.setAlarm`. See [Storage](/rivet/storage#set-an-alarm).
 
+## Reset it with abort
+
+When the room's memory can't be trusted anymore, `state.abort` resets it, as on Cloudflare. The next call builds a fresh instance, which starts again from storage:
+
+```typescript title="src/room.ts"
+yield* state.abort("the session failed");
+```
+
+`abort` never returns. Calls still running on the instance are interrupted, and so is work handed to `state.waitUntil`, so their finalizers run. The instance's WebSockets close with code `1011`, and a call that arrives before the actor has stopped gets HTTP `503`, then Rivet puts the actor to sleep. An `alarm` handler interrupted by `abort` runs again later, unless it passes `{ retryAlarm: false }`.
+
+Rivet keeps the node's process when it stops an actor, so a fiber the instance forked detached keeps running after the reset. Interrupt it when the instance stops.
+
 ## Keep its code out of its callers
 
 A caller imports the class to call it, and the class carries its implementation with it. When the implementation is large, or imports things a caller shouldn't bundle, declare the class on its own with the shape of its methods:

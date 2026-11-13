@@ -5,6 +5,8 @@
 import * as Docker from "@alchemy.run/docker";
 import * as Rivet from "@alchemy.run/rivet";
 import * as StreamFormat from "@alchemy.run/rivet/StreamFormat";
+import { RpcCallError } from "alchemy/Rpc";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Headers from "effect/http/Headers";
@@ -20,6 +22,7 @@ import Counter from "./counter.ts";
 import GatedTally from "./gated-tally.ts";
 import Greeter from "./greeter.ts";
 import { Reentrant } from "./reentrant-declaration.ts";
+import Resettable from "./resettable.ts";
 import Room from "./room.ts";
 import SocketRoom from "./socket-room.ts";
 import Tally from "./tally.ts";
@@ -43,6 +46,7 @@ export default class Front extends Docker.Service<Front>()(
     const parallelTallies = yield* Tally;
     const gatedTallies = yield* GatedTally;
     const reentrants = yield* Reentrant;
+    const resettables = yield* Resettable;
     const rooms = yield* Room;
     const socketRooms = yield* SocketRoom;
     const chat = yield* ChatLog;
@@ -214,6 +218,61 @@ export default class Front extends Docker.Service<Front>()(
           // Give the fired alarm's call time to run once the transaction ends.
           yield* Effect.sleep("3 seconds");
           return yield* HttpServerResponse.json(yield* tally.alarmState());
+        }
+        // `state.abort` (see resettable.ts). `reset` aborts an instance while
+        // a call hangs on it; `alarm?retry=0|1` aborts from its alarm.
+        if (group === "resettable" && name !== undefined) {
+          const which = url.pathname.split("/").filter((segment) => segment.length > 0)[2];
+          const instance = resettables.getByName(name);
+          // The HTTP status a call ended with: 200, or what the instance answered.
+          const status = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+            effect.pipe(
+              Effect.as(200),
+              Effect.catch((error) =>
+                Effect.succeed(error instanceof RpcCallError ? (error.status ?? 0) : 0),
+              ),
+              Effect.timeoutOrElse({ duration: "30 seconds", orElse: () => Effect.succeed(-1) }),
+            );
+          // Calls that reach the aborted activation before it stops get 503.
+          const untilServed = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+            effect.pipe(Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 120 }));
+          if (which === "reset") {
+            yield* instance.ping();
+            const before = yield* instance.ping();
+            const hanging = yield* Effect.forkChild(Effect.timed(status(instance.hang())));
+            yield* Effect.sleep("1 second");
+            const aborted = yield* status(instance.abort());
+            const [hangTime, hang] = yield* Fiber.join(hanging);
+            const after = yield* untilServed(instance.ping());
+            return yield* HttpServerResponse.json({
+              before,
+              aborted,
+              hang,
+              // How long the hanging call ran: a second, then the abort.
+              hangMs: Duration.toMillis(hangTime),
+              after,
+              hangInterrupted: yield* untilServed(instance.read("hang-interrupted")),
+            });
+          }
+          if (which === "alarm") {
+            const retry = url.searchParams.get("retry") !== "0";
+            yield* instance.armAbortingAlarm(retry);
+            const state = untilServed(instance.alarmState());
+            const ran = yield* state.pipe(
+              Effect.repeat({
+                schedule: Schedule.spaced("500 millis"),
+                until: (alarm) => alarm.runs >= (retry ? 2 : 1),
+                times: 60,
+              }),
+            );
+            // Long enough for a retry to show (the first comes 2 seconds on).
+            yield* Effect.sleep("5 seconds");
+            return yield* HttpServerResponse.json({
+              ran,
+              final: yield* state,
+              boots: yield* untilServed(instance.read("boots")),
+            });
+          }
         }
         // Calls that could deadlock on a transaction (see reentrant.ts).
         // Each returns how the instance saw it end, then what it holds.

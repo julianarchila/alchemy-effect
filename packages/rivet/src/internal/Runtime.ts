@@ -8,6 +8,8 @@
  */
 import type { DurableObjectExport } from "alchemy/Workers/DurableObject";
 import {
+  DurableObjectAborted,
+  isAbortedExit,
   makeDurableObjectInstance,
   type DurableObjectInstance,
 } from "alchemy/Workers/DurableObjectBridge";
@@ -25,9 +27,12 @@ import type { HostedDurableObject } from "../DurableObject.ts";
 import {
   ALARM_ACTION,
   DurableObjectState,
+  makeActivationAbort,
   makeDurableObjectState,
   migrateStorage,
+  redeliverAlarm,
   runFiredAlarm,
+  type ActivationAbort,
   type ActorContextLike,
 } from "../DurableObjectState.ts";
 import type { WebSocket } from "../WebSocket.ts";
@@ -53,6 +58,8 @@ interface ActivationVars {
   instance: DurableObjectInstance | undefined;
   activation: Activation | undefined;
   sockets: SocketRegistry | undefined;
+  /** How the activation is aborted; exists before the instance does. */
+  abort: ActivationAbort;
 }
 
 type ActivationContext = ActorContextLike & {
@@ -66,10 +73,38 @@ const env = (name: string): string | undefined => process.env[name];
 
 const deadlock = (message: string) => new Response(message, { status: DEADLOCK_STATUS });
 
+/** The answer to a call on an aborted activation: the next one will serve it. */
+const abortedResponse = (reason: string) =>
+  new Response(new DurableObjectAborted({ reason }).message, {
+    status: 503,
+    headers: { "retry-after": "1" },
+  });
+
+/** A WebSocket close reason is at most 123 bytes. */
+const closeReason = (reason: string) => {
+  const bytes = new TextEncoder().encode(reason);
+  return bytes.length <= 123 ? reason : new TextDecoder().decode(bytes.slice(0, 120)) + "...";
+};
+
+/** Fails once the activation is aborted. */
+const whenAborted = (abort: ActivationAbort) =>
+  Effect.callback<never>((resume) => {
+    const signal = abort.controller.signal;
+    const fail = () =>
+      resume(Effect.die(new DurableObjectAborted({ reason: abort.aborted?.reason ?? "aborted" })));
+    if (signal.aborted) {
+      fail();
+      return;
+    }
+    signal.addEventListener("abort", fail, { once: true });
+    return Effect.sync(() => signal.removeEventListener("abort", fail));
+  });
+
 /** Serve one actor request through the instance's `fetch` (and fetch-RPC). */
 const handleRequest = (
   instance: DurableObjectInstance,
   activation: Activation,
+  abort: ActivationAbort,
   request: Request,
 ) => {
   const awaiting = receive(request.headers.get(AWAITING_HEADER));
@@ -103,7 +138,11 @@ const handleRequest = (
           response = HttpServerResponse.setBody(
             response,
             HttpBody.stream(
-              Stream.ensuring(response.body.stream, Effect.sync(done)),
+              // An abort ends the body with an error, not as if complete.
+              response.body.stream.pipe(
+                Stream.interruptWhen(whenAborted(abort)),
+                Stream.ensuring(Effect.sync(done)),
+              ),
               response.body.contentType,
               response.body.contentLength,
             ),
@@ -114,11 +153,13 @@ const handleRequest = (
     async (exit) =>
       Exit.isSuccess(exit)
         ? (exit.value as Response)
-        : isDeadlock(exit.cause)
-          ? deadlock(
-              "A transaction on this Durable Object waits on this call, which needs its storage.",
-            )
-          : new Response("Internal Server Error", { status: 500 }),
+        : isAbortedExit(exit)
+          ? abortedResponse(abort.aborted?.reason ?? "aborted")
+          : isDeadlock(exit.cause)
+            ? deadlock(
+                "A transaction on this Durable Object waits on this call, which needs its storage.",
+              )
+            : new Response("Internal Server Error", { status: 500 }),
   );
 };
 
@@ -222,6 +263,8 @@ export const runDurableObjects = (durableObjects: ReadonlyArray<HostedDurableObj
     if (durableObjects.length === 0) return yield* Effect.never;
     const { actor, setup } = yield* Effect.promise(() => import("rivetkit"));
     const { db } = yield* Effect.promise(() => import("rivetkit/db"));
+    // The node's services, for work an actor callback runs.
+    const context = yield* Effect.context<never>();
 
     const use: Record<string, unknown> = {};
     for (const hosted of durableObjects) {
@@ -256,7 +299,7 @@ export const runDurableObjects = (durableObjects: ReadonlyArray<HostedDurableObj
             // instance from the bridge.
             services: Context.make(
               DurableObjectState,
-              makeDurableObjectState(c, activation, sockets),
+              makeDurableObjectState(c, activation, sockets, c.vars.abort),
             ).pipe(
               // Construction runs under the activation's construction
               // section; each call replaces it with what it was sent.
@@ -275,6 +318,22 @@ export const runDurableObjects = (durableObjects: ReadonlyArray<HostedDurableObj
             dispatch: "static",
           });
           c.vars.instance = instance;
+          const built = instance;
+          const aborting = c.vars.abort;
+          aborting.abort = (reason, options) => {
+            if (aborting.aborted !== undefined) return;
+            aborting.aborted = { reason, retryAlarm: options?.retryAlarm ?? true };
+            // Construction and the running calls, then the work they handed
+            // off, then the response bodies still streaming.
+            built.abort(reason);
+            for (const fiber of aborting.background) fiber.interruptUnsafe();
+            aborting.controller.abort();
+            sockets.closeAll(1011, closeReason(reason));
+            // RivetKit keeps the process: the instance is discarded with the
+            // activation's vars once the actor stops, and the next call
+            // starts a fresh activation.
+            c.sleep();
+          };
         }
         const activation = c.vars.activation!;
         // Construction has finished once a call starts, or fails.
@@ -286,7 +345,12 @@ export const runDurableObjects = (durableObjects: ReadonlyArray<HostedDurableObj
               return fn(shape);
             }, onExit)
             .finally(constructed);
-        return { instance: { ...instance, execute }, activation, sockets: c.vars.sockets! };
+        return {
+          instance: { ...instance, execute },
+          activation,
+          sockets: c.vars.sockets!,
+          abort: c.vars.abort,
+        };
       };
 
       use[name] = actor({
@@ -295,14 +359,19 @@ export const runDurableObjects = (durableObjects: ReadonlyArray<HostedDurableObj
           instance: undefined,
           activation: undefined,
           sockets: undefined,
+          abort: makeActivationAbort(),
         }),
         onRequest: (c: ActivationContext, request: Request) => {
-          const { instance, activation } = instanceOf(c);
-          return handleRequest(instance, activation, request);
+          const aborted = c.vars.abort.aborted;
+          if (aborted !== undefined) return abortedResponse(aborted.reason);
+          const { instance, activation, abort } = instanceOf(c);
+          return handleRequest(instance, activation, abort, request);
         },
         // A WebSocket through the gateway: the instance's `fetch` accepts it
         // with `Rivet.upgrade()`.
         onWebSocket: (c: ActivationContext, ws: RawWebSocket) => {
+          const aborted = c.vars.abort.aborted;
+          if (aborted !== undefined) return ws.close(1011, closeReason(aborted.reason));
           const { instance, activation, sockets } = instanceOf(c);
           return handleWebSocket(instance, activation, sockets, c.request, ws);
         },
@@ -311,21 +380,41 @@ export const runDurableObjects = (durableObjects: ReadonlyArray<HostedDurableObj
           // wait out a transaction before its handler runs as long as it
           // takes: the action only starts it, kept awake until it's done.
           [ALARM_ACTION]: (c: ActivationContext, token: unknown) => {
-            void c.keepAwake(
-              instanceOf(c).instance.execute((shape) =>
-                runFiredAlarm(
-                  c,
-                  token,
-                  typeof shape.alarm === "function"
-                    ? Effect.suspend(() => (shape.alarm as () => Effect.Effect<void>)())
-                    : undefined,
-                ).pipe(
-                  Effect.provideService(Awaiting, receive(undefined)),
+            // An aborted activation can't run it: the next one will.
+            const redeliver = () =>
+              Effect.runPromiseWith(context)(
+                redeliverAlarm(c, token).pipe(
                   Effect.catchCause((cause) =>
-                    Effect.logError("Durable Object alarm could not run", cause),
+                    Effect.logError("Durable Object alarm could not be redelivered", cause),
                   ),
                 ),
-              ),
+              );
+            if (c.vars.abort.aborted !== undefined) {
+              void c.keepAwake(redeliver());
+              return;
+            }
+            const { instance, abort } = instanceOf(c);
+            let started = false;
+            void c.keepAwake(
+              instance
+                .execute((shape) => {
+                  started = true;
+                  return runFiredAlarm(
+                    c,
+                    token,
+                    typeof shape.alarm === "function"
+                      ? Effect.suspend(() => (shape.alarm as () => Effect.Effect<void>)())
+                      : undefined,
+                    { retryInterrupted: () => abort.aborted?.retryAlarm !== false },
+                  ).pipe(
+                    Effect.provideService(Awaiting, receive(undefined)),
+                    Effect.catchCause((cause) =>
+                      Effect.logError("Durable Object alarm could not run", cause),
+                    ),
+                  );
+                })
+                // Aborted before it started: it was never claimed.
+                .catch(() => (started || abort.aborted === undefined ? undefined : redeliver())),
             );
           },
         },

@@ -28,12 +28,15 @@ export interface SocketRegistry {
   readonly add: (ws: RawWebSocket, tags: ReadonlyArray<string>) => WebSocket;
   readonly remove: (socket: WebSocket) => void;
   readonly all: (tag?: string) => ReadonlyArray<WebSocket>;
+  /** Close every open socket, and forget it. */
+  readonly closeAll: (code: number, reason: string) => void;
 }
 
 const OPEN = 1;
 
 export const makeSocketRegistry = (): SocketRegistry => {
   const open = new Set<WebSocket>();
+  const raw = new Map<WebSocket, RawWebSocket>();
   return {
     add: (ws, tags) => {
       let attachment: unknown = null;
@@ -46,6 +49,7 @@ export const makeSocketRegistry = (): SocketRegistry => {
         close: (code, reason) =>
           Effect.sync(() => {
             open.delete(socket);
+            raw.delete(socket);
             if (ws.readyState <= OPEN) ws.close(code, reason);
           }),
         serializeAttachment: (value) => {
@@ -55,9 +59,18 @@ export const makeSocketRegistry = (): SocketRegistry => {
           (attachment === null ? null : structuredClone(attachment)) as T | null,
       };
       open.add(socket);
+      raw.set(socket, ws);
       return socket;
     },
-    remove: (socket) => void open.delete(socket),
+    remove: (socket) => {
+      open.delete(socket);
+      raw.delete(socket);
+    },
     all: (tag) => [...open].filter((socket) => tag === undefined || socket.tags.includes(tag)),
+    closeAll: (code, reason) => {
+      for (const ws of raw.values()) if (ws.readyState <= OPEN) ws.close(code, reason);
+      open.clear();
+      raw.clear();
+    },
   };
 };
