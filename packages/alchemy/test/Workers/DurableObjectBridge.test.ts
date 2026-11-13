@@ -242,6 +242,45 @@ describe("shared Durable Object instance bridge", { tags: ["unit", "local"] }, (
       }),
     );
 
+    it.effect("wins over the scope the class phase captured", () =>
+      Effect.gen(function* () {
+        // In a deploy, the class phase runs inside the Worker's or node's
+        // Layer build, so the services it captured hold that build's scope,
+        // which lasts as long as the process.
+        const processScope = yield* Scope.make();
+        const ended: string[] = [];
+        let constructorScope: Scope.Scope | undefined;
+        const built = makeBuild(
+          Effect.succeed(
+            Effect.gen(function* () {
+              constructorScope = yield* Effect.scope;
+              yield* Effect.addFinalizer(() => Effect.sync(() => ended.push("instance")));
+              return {};
+            }),
+          ),
+        );
+        const core = makeDurableObjectInstance({
+          build: () =>
+            Promise.resolve({
+              ...built,
+              export: {
+                ...built.export,
+                services: Context.add(built.export.services, Scope.Scope, processScope),
+              },
+            }),
+          services: Context.empty(),
+          waitUntil: () => {},
+          dispatch: "proxy",
+        });
+        yield* Effect.promise(() => core.instance);
+        expect(constructorScope).not.toBe(processScope);
+        yield* Effect.promise(() => core.close());
+        expect(ended).toEqual(["instance"]);
+        yield* Scope.close(processScope, Exit.void);
+        expect(ended).toEqual(["instance"]);
+      }),
+    );
+
     it.effect(
       "interrupts its calls and their background work, and closes their scopes before its own",
       () =>
